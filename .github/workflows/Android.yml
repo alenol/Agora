@@ -1,0 +1,65 @@
+name: Apply Incremental Package
+
+# 增量包部署工作流（unzip-and-overwrite）。
+# 用法：
+#   1. 把增量包（如 agora-local-model-control.zip）放到仓库的 incremental/ 目录并提交到 master；
+#      或在 Actions 页面手动运行（workflow_dispatch），可指定包路径。
+#   2. 本工作流会解压增量包（内含仓库相对路径），覆盖式写入仓库对应文件并提交。
+#   3. 提交信息含 [skip ci]，不会触发自身再次运行，避免死循环。
+
+on:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: "Path (relative to repo root) to the incremental .zip package"
+        required: false
+        default: "incremental/agora-local-model-control.zip"
+  push:
+    branches: [master]
+    paths:
+      - "incremental/**.zip"
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Resolve package path
+        id: pkg
+        run: |
+          PKG="${{ github.event.inputs.package }}"
+          if [ -z "$PKG" ]; then PKG="incremental/agora-local-model-control.zip"; fi
+          echo "path=$PKG" >> "$GITHUB_OUTPUT"
+          if [ ! -f "$PKG" ]; then
+            echo "::error::Incremental package not found: $PKG"
+            exit 1
+          fi
+
+      - name: Inspect package contents
+        run: |
+          echo "Package: ${{ steps.pkg.outputs.path }}"
+          unzip -l "${{ steps.pkg.outputs.path }}"
+
+      - name: Unzip and overwrite
+        run: |
+          # Overwrite repo files using the repo-relative paths stored in the archive.
+          unzip -o "${{ steps.pkg.outputs.path }}" -d .
+
+      - name: Commit applied changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to apply."
+            exit 0
+          fi
+          git commit -m "chore: apply incremental package (local model load/unload + status) [skip ci]"
+          git push
