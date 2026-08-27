@@ -7,13 +7,20 @@ import com.newoether.agora.R
 import com.newoether.agora.util.DebugLog
 import com.newoether.agora.api.util.ThinkingParser
 import com.newoether.agora.api.util.prepareMessages
+import com.newoether.agora.data.LocalChatModelConfig
 import com.newoether.agora.data.repository.SettingsRepository
 import com.newoether.agora.model.ChatMessage
 import com.newoether.agora.model.Participant
 import com.newoether.agora.model.TokenUsage
 import com.newoether.agora.util.Constants
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.CoroutineScope
+import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
@@ -21,7 +28,22 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import com.newoether.agora.viewmodel.GenerationCancelHandle
-import kotlin.coroutines.coroutineContext
+
+/**
+ * Lifecycle state of the single on-device chat engine owned by this provider.
+ *
+ * The UI (Settings ▸ Local Models) renders a Load/Unload button whose label flips based on
+ * this state, and shows a status line. The cancel semantics requested by the user map to:
+ *   - Loading  → show "Unload" (cancels the in-flight load)
+ *   - Unloading→ show "Load"   (re-loads immediately)
+ */
+sealed class LocalModelLoadState {
+    object Idle : LocalModelLoadState()
+    data class Loading(val modelId: String) : LocalModelLoadState()
+    data class Loaded(val modelId: String) : LocalModelLoadState()
+    data class Unloading(val modelId: String) : LocalModelLoadState()
+    data class Error(val message: String) : LocalModelLoadState()
+}
 
 class LocalProvider(
     private val context: Context,
@@ -31,6 +53,11 @@ class LocalProvider(
     companion object {
         private const val TAG = "LocalProvider"
         private const val CONTEXT_EXCEEDED_PREFIX = "LOCAL_CONTEXT_EXCEEDED:"
+
+        /** Generation watchdog: if the native backend emits no token for this long, we cancel it.
+         *  Fixes the "stuck at sending" symptom caused by a wedged llama.cpp sampling loop. */
+        private const val STALL_CHECK_MS = 5_000L
+        private const val STALL_TIMEOUT_MS = 90_000L
     }
 
     override val name: String = Constants.PROVIDER_LOCAL
@@ -38,6 +65,10 @@ class LocalProvider(
 
     private var currentEngine: LlamaChatEngine? = null
     private val engineLock = Mutex()
+
+    private val _loadState = MutableStateFlow<LocalModelLoadState>(LocalModelLoadState.Idle)
+    /** Observable load/unload state for the Settings UI. */
+    val loadState: StateFlow<LocalModelLoadState> = _loadState.asStateFlow()
 
     override fun generateResponse(
         messages: List<ChatMessage>,
@@ -118,45 +149,80 @@ class LocalProvider(
                 val nativeCancel = GenerationCancelHandle { engine.cancel() }
                 streamScope?.register(nativeCancel)
                 try {
-                    tokenFlow.collect { token ->
-                        if (!coroutineContext.isActive) {
-                            engine.cancel()
-                            return@collect
+                    var lastActivity = System.currentTimeMillis()
+                    var stalled = false
+                    // Watchdog: a wedged native backend would otherwise hang the UI at "Sending…"
+                    // forever. Cancelling the engine makes the callbackFlow close (onError/onDone),
+                    // releasing LocalModelSerializer.mutex and surfacing a clear error to the user.
+                    // Runs in a detached child scope because flow { } has no CoroutineScope receiver.
+                    val watchdogScope = CoroutineScope(coroutineContext + Dispatchers.IO)
+                    val stallWatcher = watchdogScope.launch {
+                        while (isActive) {
+                            delay(STALL_CHECK_MS)
+                            if (System.currentTimeMillis() - lastActivity > STALL_TIMEOUT_MS) {
+                                DebugLog.e(TAG, "Local generation stalled ${STALL_TIMEOUT_MS}ms with no output; cancelling native backend")
+                                engine.cancel()
+                                stalled = true
+                                break
+                            }
                         }
-                        if (stopped) return@collect
-                        totalTokens++
+                    }
+                    try {
+                        tokenFlow.collect { token ->
+                            lastActivity = System.currentTimeMillis()
+                            if (!coroutineContext.isActive) {
+                                engine.cancel()
+                                return@collect
+                            }
+                            if (stopped) return@collect
+                            totalTokens++
 
-                        // Check for stop patterns in the rolling buffer
-                        rawBuf += token
-                        val hit = STOP_PATTERNS.firstOrNull { p -> rawBuf.contains(p) }
-                        if (hit != null) {
-                            // Strip the stop pattern and anything after it, then stop
-                            val cleanEnd = rawBuf.substringBefore(hit)
-                            if (cleanEnd.isNotEmpty()) {
+                            // Check for stop patterns in the rolling buffer
+                            rawBuf += token
+                            val hit = STOP_PATTERNS.firstOrNull { p -> rawBuf.contains(p) }
+                            if (hit != null) {
+                                // Strip the stop pattern and anything after it, then stop
+                                val cleanEnd = rawBuf.substringBefore(hit)
+                                if (cleanEnd.isNotEmpty()) {
+                                    thinkParser.feed(
+                                        content = cleanEnd,
+                                        thinkingEnabled = config.thinkingEnabled,
+                                        onText = { emit(StreamEvent.TextChunk(it)) },
+                                        onThought = { emit(StreamEvent.ThoughtChunk(it)) }
+                                    )
+                                }
+                                engine.cancel()
+                                stopped = true
+                                return@collect
+                            }
+
+                            // Keep buffer bounded — only as much as longest stop pattern
+                            val maxPatLen = STOP_PATTERNS.maxOf { it.length }
+                            if (rawBuf.length > maxPatLen * 2) {
+                                val emitPart = rawBuf.substring(0, rawBuf.length - maxPatLen)
                                 thinkParser.feed(
-                                    content = cleanEnd,
+                                    content = emitPart,
                                     thinkingEnabled = config.thinkingEnabled,
                                     onText = { emit(StreamEvent.TextChunk(it)) },
                                     onThought = { emit(StreamEvent.ThoughtChunk(it)) }
                                 )
+                                rawBuf = rawBuf.substring(rawBuf.length - maxPatLen)
                             }
-                            engine.cancel()
-                            stopped = true
-                            return@collect
                         }
-
-                        // Keep buffer bounded — only as much as longest stop pattern
-                        val maxPatLen = STOP_PATTERNS.maxOf { it.length }
-                        if (rawBuf.length > maxPatLen * 2) {
-                            val emitPart = rawBuf.substring(0, rawBuf.length - maxPatLen)
-                            thinkParser.feed(
-                                content = emitPart,
-                                thinkingEnabled = config.thinkingEnabled,
-                                onText = { emit(StreamEvent.TextChunk(it)) },
-                                onThought = { emit(StreamEvent.ThoughtChunk(it)) }
+                    } finally {
+                        stallWatcher.cancel()
+                        watchdogScope.cancel()
+                    }
+                    if (stalled) {
+                        emit(
+                            StreamEvent.Error(
+                                GenerationError.LocalModel(
+                                    "本地模型生成超时（${STALL_TIMEOUT_MS / 1000} 秒无输出）。" +
+                                        "请在「本地模型」设置中卸载后重新加载，或减小上下文窗口大小。"
+                                )
                             )
-                            rawBuf = rawBuf.substring(rawBuf.length - maxPatLen)
-                        }
+                        )
+                        return@flow
                     }
                 } finally {
                     streamScope?.unregister(nativeCancel)
@@ -220,9 +286,11 @@ class LocalProvider(
                 } else {
                     existing.unloadMmproj()
                 }
+                _loadState.value = LocalModelLoadState.Loaded(model.modelId)
                 existing
             } else {
                 existing?.close()
+                currentEngine = null
                 val engine = LlamaChatEngine(model.localFilePath, model.nCtx)
                 if (engine.load()) {
                     if (model.mmprojPath.isNotBlank()) {
@@ -230,8 +298,11 @@ class LocalProvider(
                         DebugLog.d(TAG, "mmproj load: $loaded")
                     }
                     currentEngine = engine
+                    _loadState.value = LocalModelLoadState.Loaded(model.modelId)
                     engine
                 } else {
+                    _loadState.value =
+                        LocalModelLoadState.Error("Failed to load model: ${model.alias} (${model.localFilePath})")
                     null
                 }
             }
@@ -324,15 +395,65 @@ class LocalProvider(
         return settings.localChatModels.first().map { it.modelId }
     }
 
+    // ── Public local-model control surface (used by Settings ▸ Local Models) ──
+
+    /** Pre-load (warm) a local chat model. Updates [loadState] to Loading → Loaded/Error. */
+    suspend fun loadModel(model: LocalChatModelConfig): Boolean {
+        return engineLock.withLock {
+            when (_loadState.value) {
+                is LocalModelLoadState.Loading,
+                is LocalModelLoadState.Unloading -> {
+                    // Ignore re-entrant requests while a transition is in flight.
+                    false
+                }
+                else -> {
+                    _loadState.value = LocalModelLoadState.Loading(model.modelId)
+                    currentEngine?.close()
+                    currentEngine = null
+                    val engine = LlamaChatEngine(model.localFilePath, model.nCtx)
+                    if (engine.load()) {
+                        if (model.mmprojPath.isNotBlank()) engine.loadMmproj(model.mmprojPath)
+                        currentEngine = engine
+                        _loadState.value = LocalModelLoadState.Loaded(model.modelId)
+                        true
+                    } else {
+                        _loadState.value = LocalModelLoadState.Error(
+                            "Failed to load model: ${model.alias} (${model.localFilePath})"
+                        )
+                        false
+                    }
+                }
+            }
+        }
+    }
+
+    /** Unload the resident engine and return to Idle. Safe to call while Loading (cancels it). */
+    suspend fun unloadModel() {
+        engineLock.withLock {
+            val activePath = currentEngine?.modelPath ?: ""
+            _loadState.value = LocalModelLoadState.Unloading(activePath)
+            currentEngine?.close()
+            currentEngine = null
+            _loadState.value = LocalModelLoadState.Idle
+        }
+    }
+
+    /** Cancel an in-flight load (used by the "Unload" button shown while Loading). */
+    suspend fun cancelLoad() {
+        unloadModel()
+    }
+
     fun close() {
         currentEngine?.close()
         currentEngine = null
+        _loadState.value = LocalModelLoadState.Idle
     }
 
     suspend fun releaseEngine() {
         engineLock.withLock {
             currentEngine?.close()
             currentEngine = null
+            _loadState.value = LocalModelLoadState.Idle
         }
     }
 
