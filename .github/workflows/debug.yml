@@ -1,0 +1,68 @@
+name: Build Debug (with in-app logs)
+
+# 诊断专用构建：与 build.yml 同构，产出未签名的 fdroidDebug APK。
+# Debug 构建默认可调试（FLAG_DEBUGGABLE），DebugLog 自动开启，
+# 因此「设置 ▸ 日志查看」里能看到本地模型加载/生成的诊断日志，便于排查 failed to load 等问题。
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'incremental/**.zip'
+  workflow_dispatch:
+    inputs:
+      package:
+        description: 'Path to the incremental package zip (repo-relative)'
+        required: false
+        default: 'incremental/agora-local-model-control.zip'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-debug-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-debug:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Unzip and overwrite (apply incremental package)
+        run: |
+          PKG="${{ github.event.inputs.package }}"
+          if [ -z "$PKG" ]; then PKG="incremental/agora-local-model-control.zip"; fi
+          if [ ! -f "$PKG" ]; then
+            echo "::error::Incremental package not found: $PKG"
+            exit 1
+          fi
+          echo "Applying incremental package: $PKG"
+          unzip -o "$PKG" -d .
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: gradle
+
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: "ndk;28.2.13676358"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Build F-Droid Debug APK (with logs)
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleFdroidDebug --no-daemon
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: agora-fdroid-debug-logs
+          path: app/build/outputs/apk/fdroid/debug/*.apk
+
