@@ -1,45 +1,43 @@
 name: Apply Incremental Package & Build APK
 
-# 增量包部署 + 构建工作流（unzip-and-overwrite → build APK）。
-#
-# 重要：本工作流文件本身需要手动提交到仓库一次（通过 GitHub Web UI 或本地 git push 均可，
-#       因为你自己的账号有 workflows 写权限）。之后它就会被自动触发，无需再手动改它。
-#       增量包（.zip）里只放「源码改动」，不要包含 .github/workflows 下的文件，
-#       这样 GITHUB_TOKEN 用 contents: write 即可完成推送，避免 workflows 权限报错。
-#
-# 用法（二选一）：
-#   A. 把增量包（如 incremental/agora-local-model-control.zip）提交到 master 的 incremental/ 目录，
-#      推送即自动触发（push 事件匹配 incremental/**.zip）。
-#   B. 在 Actions 页面手动 Run workflow，可指定包路径。
-#
-# 流程：检出 → 解压覆盖 → 提交源码改动([skip ci]) → 配置 JDK/Android SDK → Gradle 构建 APK → 上传产物。
-
 on:
-  workflow_dispatch:
-    inputs:
-      package:
-        description: "Path (relative to repo root) to the incremental .zip package"
-        required: false
-        default: "incremental/agora-local-model-control.zip"
   push:
     branches: [master]
     paths:
-      - "incremental/**.zip"
+      - 'incremental/**.zip'
+  workflow_dispatch:
+    inputs:
+      package:
+        description: 'Path to the incremental package zip (repo-relative)'
+        required: false
+        default: 'incremental/agora-local-model-control.zip'
 
 permissions:
   contents: write
 
-env:
-  GRADLE_OPTS: "-Xmx2g -XX:MaxMetaspaceSize=512m"
+concurrency:
+  group: apply-incremental-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   apply-and-build:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GRADLE_OPTS: -Xmx2g -XX:MaxMetaspaceSize=512m
     steps:
+      - name: Set up job
+        run: echo "Starting incremental apply & build"
+
+      # ── 关键修复：必须递归拉取 git 子模块，否则 thirdparty/llama.cpp 为空，
+      #    CMake 的 add_subdirectory 会因找不到 CMakeLists.txt 而失败。 ──
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          repository: alenol/Agora
+          submodules: recursive        # ← false 改为 recursive
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Resolve package path
         id: pkg
@@ -58,9 +56,7 @@ jobs:
           unzip -l "${{ steps.pkg.outputs.path }}"
 
       - name: Unzip and overwrite
-        run: |
-          # 用归档里的仓库相对路径，覆盖式写入仓库对应文件。
-          unzip -o "${{ steps.pkg.outputs.path }}" -d .
+        run: unzip -o "${{ steps.pkg.outputs.path }}" -d .
 
       - name: Commit applied source changes
         run: |
@@ -80,24 +76,17 @@ jobs:
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: 17
           cache: gradle
 
+      # NDK 28.2.13676358 与 CMake 3.22.1 在 GitHub  runners 上已预装 / 由 AGP 自动下载，
+      # 无需额外安装步骤（与仓库官方 build.yml 行为一致）。
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Accept Android SDK licenses
-        run: yes | sdkmanager --licenses || true
+        run: |
+          yes | sdkmanager --licenses || true
+          sdkmanager "tools" "platform-tools"
 
       - name: Build debug APK
         run: |
           chmod +x gradlew
           ./gradlew assembleDebug --no-daemon
-
-      - name: Upload APK
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: app-debug-apk
-          path: app/build/outputs/apk/debug/*.apk
-          if-no-files-found: error
