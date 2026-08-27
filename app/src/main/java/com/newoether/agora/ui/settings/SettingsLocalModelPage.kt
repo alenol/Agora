@@ -59,12 +59,12 @@ fun SettingsLocalModelPage(viewModel: ChatViewModel, onBack: () -> Unit) {
 
         // Overall engine status banner
         item(key = "local_model_banner") {
-            val (bannerText, bannerTint) = when (loadState) {
+            val (bannerText, bannerTint) = when (val state = loadState) {
                 LocalModelLoadState.Idle -> "当前没有加载任何本地模型" to MaterialTheme.colorScheme.onSurfaceVariant
-                is LocalModelLoadState.Loading -> "正在加载：${loadState.modelId}" to MaterialTheme.colorScheme.primary
-                is LocalModelLoadState.Loaded -> "已加载并常驻内存：${loadState.modelId}" to MaterialTheme.colorScheme.primary
-                is LocalModelLoadState.Unloading -> "正在卸载：${loadState.modelId}" to MaterialTheme.colorScheme.primary
-                is LocalModelLoadState.Error -> "加载失败：${loadState.message}" to MaterialTheme.colorScheme.error
+                is LocalModelLoadState.Loading -> "正在加载：${state.modelId}" to MaterialTheme.colorScheme.primary
+                is LocalModelLoadState.Loaded -> "已加载并常驻内存：${state.modelId}" to MaterialTheme.colorScheme.primary
+                is LocalModelLoadState.Unloading -> "正在卸载：${state.modelId}" to MaterialTheme.colorScheme.primary
+                is LocalModelLoadState.Error -> "加载失败：${state.message}" to MaterialTheme.colorScheme.error
             }
             CardSurface(shape = FullRounded) {
                 SettingsItem(
@@ -131,22 +131,23 @@ fun SettingsLocalModelPage(viewModel: ChatViewModel, onBack: () -> Unit) {
                 else -> MidRounded
             }
 
-            val isThisLoaded = loadState is LocalModelLoadState.Loaded && loadState.modelId == model.modelId
-            val isThisLoading = loadState is LocalModelLoadState.Loading && loadState.modelId == model.modelId
-            val isThisUnloading = loadState is LocalModelLoadState.Unloading && loadState.modelId == model.modelId
-            val engineBusy = loadState is LocalModelLoadState.Loading || loadState is LocalModelLoadState.Unloading
+            val state = loadState
+            val isThisLoaded = state is LocalModelLoadState.Loaded && state.modelId == model.modelId
+            val isThisLoading = state is LocalModelLoadState.Loading && state.modelId == model.modelId
+            val isThisUnloading = state is LocalModelLoadState.Unloading && state.modelId == model.modelId
+            val engineBusy = state is LocalModelLoadState.Loading || state is LocalModelLoadState.Unloading
 
             val (label, enabled, showSpinner, onClick) = when {
                 // 加载中 → 显示「卸载」按钮（取消加载）
-                isThisLoading -> Quad("卸载", true, true) { scope.launch(Dispatchers.IO) { localProvider.cancelLoad() } }
+                isThisLoading -> Quad("卸载", true, true) { scope.launch(Dispatchers.IO) { localProvider.cancelLoad() }; Unit }
                 // 卸载中 → 显示「加载」按钮（立即重新加载）
-                isThisUnloading -> Quad("加载", true, true) { scope.launch(Dispatchers.IO) { localProvider.loadModel(model) } }
+                isThisUnloading -> Quad("加载", true, true) { scope.launch(Dispatchers.IO) { localProvider.loadModel(model) }; Unit }
                 // 已加载 → 显示「卸载」按钮
-                isThisLoaded -> Quad("卸载", true, false) { scope.launch(Dispatchers.IO) { localProvider.unloadModel() } }
+                isThisLoaded -> Quad("卸载", true, false) { scope.launch(Dispatchers.IO) { localProvider.unloadModel() }; Unit }
                 // 其他模型操作中 → 本模型「加载」按钮禁用
                 engineBusy -> Quad("加载", false, false) { }
                 // 空闲 / 出错 → 显示「加载」按钮
-                else -> Quad("加载", true, false) { scope.launch(Dispatchers.IO) { localProvider.loadModel(model) } }
+                else -> Quad("加载", true, false) { scope.launch(Dispatchers.IO) { localProvider.loadModel(model) }; Unit }
             }
 
             val statusText = when {
