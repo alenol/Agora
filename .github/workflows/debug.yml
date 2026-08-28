@@ -81,6 +81,18 @@ jobs:
           version: latest
           cache: true
 
+      # SPIRV-Headers：ggml-vulkan 的 CMake 需要 find_package(SPIRV-Headers CONFIG REQUIRED)
+      # 来编译 .comp shader。Vulkan SDK 的 prebuilt 提取不含其 cmake 配置，且交叉编译到
+      # Android 时 NDK 的 CMAKE_FIND_ROOT_PATH 会把 host 包排除，故单独把它装进 VULKAN_SDK
+      # 前缀；app 的 CMakeLists 再用 SPIRV-Headers_DIR 精确指过去（精确路径不受 root-path 重映射）。
+      - name: Install SPIRV-Headers into Vulkan SDK
+        run: |
+          git clone --depth 1 https://github.com/KhronosGroup/SPIRV-Headers.git "$RUNNER_TEMP/spirv-headers"
+          cmake -S "$RUNNER_TEMP/spirv-headers" -B "$RUNNER_TEMP/spirv-headers-build" \
+            -DCMAKE_INSTALL_PREFIX="$VULKAN_SDK" -DCMAKE_BUILD_TYPE=Release
+          cmake --build "$RUNNER_TEMP/spirv-headers-build" -j"$(nproc)"
+          cmake --install "$RUNNER_TEMP/spirv-headers-build"
+
       - uses: gradle/actions/setup-gradle@v4
 
       # Force a clean native (CMake/NDK) rebuild so JNI changes in the incremental
