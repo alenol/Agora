@@ -70,15 +70,16 @@ jobs:
 
       # Vulkan SDK：GGML_VULKAN 后端在构建期需要用 glslc 编译 .comp shader，
       # 并且 CMake 里 find_package(Vulkan COMPONENTS glslc) / find_package(SPIRV-Headers)
-      # 必须满足，否则配置失败。LunarG 的 vulkan-sdk 元包提供了 glslc、Vulkan
-      # loader/headers 与 SPIRV-Headers。必须在 Gradle 构建（触发 CMake 配置）之前装好。
-      - name: Install Vulkan SDK
-        run: |
-          wget -qO /tmp/lunarg.key https://packages.lunarg.com/lunarg-signing-key.pub
-          echo "deb [signed-by=/tmp/lunarg.key] https://packages.lunarg.com/vulkan/ noble main" | sudo tee /etc/apt/sources.list.d/lunarg-vulkan.list
-          sudo apt-get update
-          sudo apt-get install -y vulkan-sdk
-          echo "VULKAN_SDK=/usr" >> "$GITHUB_ENV"
+      # 必须满足，否则配置失败。改用专用 Action 直接拉取官方 LunarG SDK 并自动设置
+      # VULKAN_SDK / PATH（含 glslc + SPIRV-Headers + Vulkan headers），完整写到
+      # $GITHUB_ENV，后续 Gradle/CMake 配置阶段即可读到。这样绕开会过期的 LunarG
+      # apt 签名 key（packages.lunarg.com/lunarg-signing-key.pub 已返回 404，导致原
+      # wget + apt 方案直接 exit 8）。必须在 Gradle 构建（触发 CMake 配置）之前装好。
+      - name: Install Vulkan SDK (for ggml-vulkan)
+        uses: humbletim/install-vulkan-sdk@v1.2
+        with:
+          version: latest
+          cache: true
 
       - uses: gradle/actions/setup-gradle@v4
 
