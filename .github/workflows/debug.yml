@@ -30,7 +30,7 @@ concurrency:
 jobs:
   debug:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
     steps:
       # 递归拉取子模块：thirdparty/llama.cpp 必须存在，否则 CMake add_subdirectory 失败。
       - uses: actions/checkout@v4
@@ -68,7 +68,25 @@ jobs:
         with:
           packages: "ndk;28.2.13676358"
 
+      # Vulkan SDK：GGML_VULKAN 后端在构建期需要用 glslc 编译 .comp shader，
+      # 并且 CMake 里 find_package(Vulkan COMPONENTS glslc) / find_package(SPIRV-Headers)
+      # 必须满足，否则配置失败。LunarG 的 vulkan-sdk 元包提供了 glslc、Vulkan
+      # loader/headers 与 SPIRV-Headers。必须在 Gradle 构建（触发 CMake 配置）之前装好。
+      - name: Install Vulkan SDK
+        run: |
+          wget -qO /tmp/lunarg.key https://packages.lunarg.com/lunarg-signing-key.pub
+          echo "deb [signed-by=/tmp/lunarg.key] https://packages.lunarg.com/vulkan/ noble main" | sudo tee /etc/apt/sources.list.d/lunarg-vulkan.list
+          sudo apt-get update
+          sudo apt-get install -y vulkan-sdk
+          echo "VULKAN_SDK=/usr" >> "$GITHUB_ENV"
+
       - uses: gradle/actions/setup-gradle@v4
+
+      # Force a clean native (CMake/NDK) rebuild so JNI changes in the incremental
+      # package always recompile. Without this, Gradle's native build cache can reuse
+      # a stale .cxx object and new instrumentation never ships.
+      - name: Clean native build cache
+        run: rm -rf app/.cxx
 
       # 提速：去掉 PRoot 运行时构建与签名，直接出未签名的 fdroidDebug APK。
       - name: Build F-Droid Debug APK (with logs)
